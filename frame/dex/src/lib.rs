@@ -33,7 +33,6 @@ pub use types::*;
 // TODO: make it configurable
 // TODO: weights and benchmarking.
 // TODO: more specific error codes.
-// TODO: remove setup.
 pub const MIN_LIQUIDITY: u64 = 1;
 
 #[frame_support::pallet]
@@ -110,25 +109,21 @@ pub mod pallet {
 		type PalletId: Get<PalletId>;
 	}
 
-	pub type BalanceOf<T> =
-		<<T as Config>::Currency as InspectFungible<<T as frame_system::Config>::AccountId>>::Balance;
+	pub type BalanceOf<T> = <<T as Config>::Currency as InspectFungible<
+		<T as frame_system::Config>::AccountId,
+	>>::Balance;
 
 	pub type AssetBalanceOf<T> =
 		<<T as Config>::Assets as Inspect<<T as frame_system::Config>::AccountId>>::Balance;
 
-	pub type PoolIdOf<T> = (<T as Config>::AssetId, <T as Config>::AssetId);
+	pub type PoolIdOf<T> = <T as Config>::AssetId;
 
 	#[pallet::storage]
 	pub type Pools<T: Config> = StorageMap<
 		_,
 		Blake2_128Concat,
 		PoolIdOf<T>,
-		PoolInfo<
-			T::AccountId,
-			T::AssetId,
-			T::PoolAssetId,
-			AssetBalanceOf<T>,
-		>,
+		PoolInfo<T::AccountId, T::AssetId, T::PoolAssetId, BalanceOf<T>, AssetBalanceOf<T>>,
 		OptionQuery,
 	>;
 
@@ -167,8 +162,7 @@ pub mod pallet {
 		SwapExecuted {
 			who: T::AccountId,
 			send_to: T::AccountId,
-			asset1: T::AssetId,
-			asset2: T::AssetId,
+			token_asset_id: T::AssetId,
 			pool_id: PoolIdOf<T>,
 			amount_in: AssetBalanceOf<T>,
 			amount_out: AssetBalanceOf<T>,
@@ -212,16 +206,9 @@ pub mod pallet {
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
 		#[pallet::weight(0)]
-		pub fn create_pool(
-			origin: OriginFor<T>,
-			asset1: T::AssetId, // TODO: convert into MultiToken
-			asset2: T::AssetId,
-		) -> DispatchResult {
+		pub fn create_pool(origin: OriginFor<T>, token_asset_id: T::AssetId) -> DispatchResult {
 			let sender = ensure_signed(origin)?;
-			ensure!(asset1 != asset2, Error::<T>::EqualAssets);
-
-			let pool_id = Self::get_pool_id(asset1, asset2);
-			let (asset1, asset2) = pool_id;
+			let pool_id = token_asset_id;
 			ensure!(!Pools::<T>::contains_key(&pool_id), Error::<T>::PoolExists);
 
 			let pallet_account = Self::account_id();
@@ -237,10 +224,9 @@ pub mod pallet {
 			let pool_info = PoolInfo {
 				owner: sender.clone(),
 				lp_token,
-				asset1,
-				asset2,
-				balance1: Zero::zero(),
-				balance2: Zero::zero(),
+				token_asset_id,
+				balance_native: Zero::zero(),
+				balance_token: Zero::zero(),
 			};
 
 			Pools::<T>::insert(pool_id, pool_info);
@@ -253,19 +239,17 @@ pub mod pallet {
 		#[pallet::weight(0)]
 		pub fn add_liquidity(
 			origin: OriginFor<T>,
-			asset1: T::AssetId,
 			asset2: T::AssetId,
-			amount1_desired: AssetBalanceOf<T>,
+			amount1_desired: BalanceOf<T>,
 			amount2_desired: AssetBalanceOf<T>,
-			amount1_min: AssetBalanceOf<T>,
+			amount1_min: BalanceOf<T>,
 			amount2_min: AssetBalanceOf<T>,
 			mint_to: T::AccountId,
 			deadline: T::BlockNumber,
 		) -> DispatchResult {
 			let sender = ensure_signed(origin)?;
 
-			let pool_id = Self::get_pool_id(asset1, asset2);
-			let (asset1, asset2) = pool_id;
+			let pool_id = asset2;
 
 			ensure!(
 				amount1_desired > Zero::zero() && amount2_desired > Zero::zero(),
@@ -281,21 +265,23 @@ pub mod pallet {
 				let amount1: AssetBalanceOf<T>;
 				let amount2: AssetBalanceOf<T>;
 
-				let reserve1 = pool.balance1;
-				let reserve2 = pool.balance2;
+				let reserve1 = pool.balance_native;
+				let reserve2 = pool.balance_token;
 
 				if reserve1.is_zero() && reserve2.is_zero() {
 					amount1 = amount1_desired;
 					amount2 = amount2_desired;
 				} else {
-					let amount2_optimal = Self::quote(&amount1_desired, &reserve1, &reserve2)?;
+					let amount2_optimal =
+						Self::quote_token_inner(&amount1_desired, &reserve1, &reserve2)?;
 
 					if amount2_optimal <= amount2_desired {
 						ensure!(amount2_optimal >= amount2_min, Error::<T>::InsufficientAmount);
 						amount1 = amount1_desired;
 						amount2 = amount2_optimal;
 					} else {
-						let amount1_optimal = Self::quote(&amount2_desired, &reserve2, &reserve1)?;
+						let amount1_optimal =
+							Self::quote_native_inner(&amount2_desired, &reserve2, &reserve1)?;
 						ensure!(
 							amount1_optimal <= amount1_desired,
 							Error::<T>::OptimalAmountLessThanDesired
@@ -307,7 +293,7 @@ pub mod pallet {
 				}
 
 				let pallet_account = Self::account_id();
-				T::Assets::transfer(asset1, &sender, &pallet_account, amount1, false)?;
+				T::Currency::transfer(&sender, &pallet_account, amount1, false)?;
 				T::Assets::transfer(asset2, &sender, &pallet_account, amount2, false)?;
 
 				let total_supply = T::PoolAssets::total_issuance(pool.lp_token);
@@ -341,8 +327,8 @@ pub mod pallet {
 
 				T::PoolAssets::mint_into(pool.lp_token, &mint_to, liquidity)?;
 
-				pool.balance1 = reserve1 + amount1;
-				pool.balance2 = reserve2 + amount2;
+				pool.balance_native = reserve1 + amount1;
+				pool.balance_token = reserve2 + amount2;
 
 				Self::deposit_event(Event::LiquidityAdded {
 					who: sender,
@@ -361,18 +347,16 @@ pub mod pallet {
 		#[pallet::weight(0)]
 		pub fn remove_liquidity(
 			origin: OriginFor<T>,
-			asset1: T::AssetId,
 			asset2: T::AssetId,
 			liquidity: AssetBalanceOf<T>,
-			amount1_min: AssetBalanceOf<T>,
+			amount1_min: BalanceOf<T>,
 			amount2_min: AssetBalanceOf<T>,
 			withdraw_to: T::AccountId,
 			deadline: T::BlockNumber,
 		) -> DispatchResult {
 			let sender = ensure_signed(origin)?;
 
-			let pool_id = Self::get_pool_id(asset1, asset2);
-			let (asset1, asset2) = pool_id;
+			let pool_id = asset2;
 
 			ensure!(liquidity > Zero::zero(), Error::<T>::ZeroLiquidity);
 
@@ -385,8 +369,8 @@ pub mod pallet {
 				let pallet_account = Self::account_id();
 				T::PoolAssets::transfer(pool.lp_token, &sender, &pallet_account, liquidity, false)?;
 
-				let reserve1 = pool.balance1;
-				let reserve2 = pool.balance2;
+				let reserve1 = pool.balance_native;
+				let reserve2 = pool.balance_token;
 
 				let total_supply = T::PoolAssets::total_issuance(pool.lp_token);
 
@@ -413,11 +397,11 @@ pub mod pallet {
 
 				T::PoolAssets::burn_from(pool.lp_token, &pallet_account, liquidity)?;
 
-				T::Assets::transfer(asset1, &pallet_account, &withdraw_to, amount1, false)?;
+				T::Currency::transfer(&pallet_account, &withdraw_to, amount1, false)?;
 				T::Assets::transfer(asset2, &pallet_account, &withdraw_to, amount2, false)?;
 
-				pool.balance1 = reserve1 - amount1;
-				pool.balance2 = reserve2 - amount2;
+				pool.balance_native = reserve1 - amount1;
+				pool.balance_token = reserve2 - amount2;
 
 				Self::deposit_event(Event::LiquidityRemoved {
 					who: sender,
@@ -433,19 +417,73 @@ pub mod pallet {
 			})
 		}
 
+		/// some native --> exact number of tokens
 		#[pallet::weight(0)]
-		pub fn swap_exact_tokens_for_tokens(
+		pub fn buy_exact_tokens_for_native(
 			origin: OriginFor<T>,
-			asset1: T::AssetId,
-			asset2: T::AssetId,
-			amount_in: AssetBalanceOf<T>,
-			amount_out_min: AssetBalanceOf<T>,
+			token_asset_id: T::AssetId,
+			amount_out: AssetBalanceOf<T>,
+			amount_in_min: BalanceOf<T>,
 			send_to: T::AccountId,
 			deadline: T::BlockNumber,
 		) -> DispatchResult {
 			let sender = ensure_signed(origin)?;
 
-			let pool_id = Self::get_pool_id(asset1, asset2);
+			let pool_id = token_asset_id;
+
+			ensure!(
+				amount_out > Zero::zero() && amount_in_min > Zero::zero(),
+				Error::<T>::ZeroAmount
+			);
+
+			let now = frame_system::Pallet::<T>::block_number();
+			ensure!(deadline >= now, Error::<T>::DeadlinePassed);
+
+			Pools::<T>::try_mutate(&pool_id, |maybe_pool| {
+				let pool = maybe_pool.as_mut().ok_or(Error::<T>::PoolNotFound)?;
+
+				let amount_in =
+					Self::get_native_in(&amount_out, &pool.balance_native, &pool.balance_token)?;
+
+				ensure!(amount_in >= amount_in_min, Error::<T>::InsufficientOutputAmount);
+
+				let pallet_account = Self::account_id();
+
+				T::Currency::transfer(&sender, &pallet_account, amount_out, false)?;
+
+				ensure!(amount_out < pool.balance_token, Error::<T>::InsufficientLiquidity);
+
+				T::Assets::transfer(token_asset_id, &pallet_account, &send_to, amount_in, false)?;
+
+				pool.balance_native += amount_in;
+				pool.balance_token -= amount_out;
+
+				Self::deposit_event(Event::SwapExecuted {
+					who: sender,
+					send_to,
+					token_asset_id,
+					pool_id,
+					amount_in,
+					amount_out,
+				});
+
+				Ok(())
+			})
+		}
+
+		/// Exact number of tokens --> some native
+		#[pallet::weight(0)]
+		pub fn sell_exact_tokens_for_native(
+			origin: OriginFor<T>,
+			token_asset_id: T::AssetId,
+			amount_in: AssetBalanceOf<T>,
+			amount_out_min: BalanceOf<T>,
+			send_to: T::AccountId,
+			deadline: T::BlockNumber,
+		) -> DispatchResult {
+			let sender = ensure_signed(origin)?;
+
+			let pool_id = token_asset_id;
 
 			ensure!(
 				amount_in > Zero::zero() && amount_out_min > Zero::zero(),
@@ -458,57 +496,48 @@ pub mod pallet {
 			Pools::<T>::try_mutate(&pool_id, |maybe_pool| {
 				let pool = maybe_pool.as_mut().ok_or(Error::<T>::PoolNotFound)?;
 
-				let reserve_in = if asset1 == pool.asset1 { pool.balance1 } else { pool.balance2 };
-				let reserve_out = if asset2 == pool.asset2 { pool.balance2 } else { pool.balance1 };
+				let amount_out =
+					Self::get_native_out(&amount_in, &pool.balance_token, &pool.balance_native)?;
 
-				let amount1 = amount_in;
-				let amount2 = Self::get_amount_out(&amount1, &reserve_in, &reserve_out)?;
-
-				ensure!(amount2 >= amount_out_min, Error::<T>::InsufficientOutputAmount);
+				ensure!(amount_out >= amount_out_min, Error::<T>::InsufficientOutputAmount);
 
 				let pallet_account = Self::account_id();
-				T::Assets::transfer(asset1, &sender, &pallet_account, amount1, false)?;
 
-				let (send_asset, send_amount) =
-					Self::validate_swap(asset1, amount2, pool_id, pool.balance1, pool.balance2)?;
+				T::Assets::transfer(token_asset_id, &sender, &pallet_account, amount_in, false)?;
 
-				T::Assets::transfer(send_asset, &pallet_account, &send_to, send_amount, false)?;
+				ensure!(amount_out < pool.balance_native, Error::<T>::InsufficientLiquidity);
 
-				if send_asset == pool.asset1 {
-					pool.balance1 -= send_amount;
-					pool.balance2 += amount1;
-				} else {
-					pool.balance2 -= send_amount;
-					pool.balance1 += amount1;
-				}
+				T::Currency::transfer(&pallet_account, &sender, amount_out, false)?;
+
+				pool.balance_token += amount_in;
+				pool.balance_native -= amount_out;
 
 				Self::deposit_event(Event::SwapExecuted {
 					who: sender,
 					send_to,
-					asset1,
-					asset2,
+					token_asset_id,
 					pool_id,
 					amount_in,
-					amount_out: amount2,
+					amount_out,
 				});
 
 				Ok(())
 			})
 		}
 
+		/// Exact native --> some tokens
 		#[pallet::weight(0)]
-		pub fn swap_tokens_for_exact_tokens(
+		pub fn buy_tokens_for_exact_native(
 			origin: OriginFor<T>,
-			asset1: T::AssetId,
-			asset2: T::AssetId,
+			token_asset_id: T::AssetId,
 			amount_out: AssetBalanceOf<T>,
-			amount_in_max: AssetBalanceOf<T>,
+			amount_in_max: BalanceOf<T>,
 			send_to: T::AccountId,
 			deadline: T::BlockNumber,
 		) -> DispatchResult {
 			let sender = ensure_signed(origin)?;
 
-			let pool_id = Self::get_pool_id(asset1, asset2);
+			let pool_id = token_asset_id;
 
 			ensure!(
 				amount_out > Zero::zero() && amount_in_max > Zero::zero(),
@@ -521,36 +550,79 @@ pub mod pallet {
 			Pools::<T>::try_mutate(&pool_id, |maybe_pool| {
 				let pool = maybe_pool.as_mut().ok_or(Error::<T>::PoolNotFound)?;
 
-				let reserve_in = if asset1 == pool.asset1 { pool.balance1 } else { pool.balance2 };
-				let reserve_out = if asset2 == pool.asset2 { pool.balance2 } else { pool.balance1 };
-
-				let amount2 = amount_out;
-				let amount1 = Self::get_amount_in(&amount2, &reserve_in, &reserve_out)?;
-				ensure!(amount1 <= amount_in_max, Error::<T>::ExcessiveInputAmount);
+				let amount_in =
+					Self::get_native_in(&amount_out, &pool.balance_native, &pool.balance_token)?;
+				ensure!(amount_in <= amount_in_max, Error::<T>::ExcessiveInputAmount);
 
 				let pallet_account = Self::account_id();
-				T::Assets::transfer(asset1, &sender, &pallet_account, amount1, false)?;
+				T::Currency::transfer(&sender, &pallet_account, amount_in, false)?;
 
-				let (send_asset, send_amount) =
-					Self::validate_swap(asset1, amount2, pool_id, pool.balance1, pool.balance2)?;
+				ensure!(amount_out < pool.balance_token, Error::<T>::InsufficientLiquidity);
 
-				T::Assets::transfer(send_asset, &pallet_account, &send_to, send_amount, false)?;
+				T::Assets::transfer(token_asset_id, &pallet_account, &send_to, amount_out, false)?;
 
-				if send_asset == pool.asset1 {
-					pool.balance1 -= send_amount;
-					pool.balance2 += amount1;
-				} else {
-					pool.balance2 -= send_amount;
-					pool.balance1 += amount1;
-				}
+				pool.balance_native += amount_in;
+				pool.balance_token -= amount_out;
 
 				Self::deposit_event(Event::SwapExecuted {
 					who: sender,
 					send_to,
-					asset1,
-					asset2,
+					token_asset_id,
 					pool_id,
-					amount_in: amount2,
+					amount_in,
+					amount_out,
+				});
+
+				Ok(())
+			})
+		}
+
+		/// Some tokens --> exact native
+		#[pallet::weight(0)]
+		pub fn sell_tokens_for_exact_native(
+			origin: OriginFor<T>,
+			token_asset_id: T::AssetId,
+			amount_out: AssetBalanceOf<T>,
+			amount_in_max: BalanceOf<T>,
+			send_to: T::AccountId,
+			deadline: T::BlockNumber,
+		) -> DispatchResult {
+			let sender = ensure_signed(origin)?;
+
+			let pool_id = token_asset_id;
+
+			ensure!(
+				amount_out > Zero::zero() && amount_in_max > Zero::zero(),
+				Error::<T>::ZeroAmount
+			);
+
+			let now = frame_system::Pallet::<T>::block_number();
+			ensure!(deadline >= now, Error::<T>::DeadlinePassed);
+
+			Pools::<T>::try_mutate(&pool_id, |maybe_pool| {
+				let pool = maybe_pool.as_mut().ok_or(Error::<T>::PoolNotFound)?;
+
+				let amount_in =
+					Self::get_tokens_in(&amount_out, &pool.balance_native, &pool.balance_token)?;
+				ensure!(amount_in <= amount_in_max, Error::<T>::ExcessiveInputAmount);
+
+				let pallet_account = Self::account_id();
+
+				T::Assets::transfer(token_asset_id, &pallet_account, &send_to, amount_in, false)?;
+
+				ensure!(amount_out < pool.balance_native, Error::<T>::InsufficientLiquidity);
+
+				T::Currency::transfer(&sender, &pallet_account, amount_out, false)?;
+
+				pool.balance_token += amount_in;
+				pool.balance_native -= amount_out;
+
+				Self::deposit_event(Event::SwapExecuted {
+					who: sender,
+					send_to,
+					token_asset_id,
+					pool_id,
+					amount_in,
 					amount_out,
 				});
 
@@ -559,7 +631,6 @@ pub mod pallet {
 		}
 	}
 
-	// Your Pallet's internal functions.
 	impl<T: Config> Pallet<T> {
 		/// The account ID of the dex pallet.
 		///
@@ -569,29 +640,25 @@ pub mod pallet {
 			T::PalletId::get().into_account_truncating()
 		}
 
-		/// Returns a pool id constructed from 2 sorted assets.
-		pub fn get_pool_id(asset1: T::AssetId, asset2: T::AssetId) -> PoolIdOf<T> {
-			if asset1 <= asset2 {
-				(asset1, asset2)
+		pub fn quote_tokens(asset2: u32, amount: u64) -> Option<AssetBalanceOf<T>> {
+			let asset2: T::AssetId = asset2.into();
+			let amount = amount.into();
+			let pool_id = asset2;
+		
+			if let Some(pool) = Pools::<T>::get(pool_id) {
+				Self::quote_token_inner(&amount, &pool.balance_native, &pool.balance_token).ok()
 			} else {
-				(asset2, asset1)
+				None
 			}
 		}
 
-		pub fn quote_price(asset1: u32, asset2: u32, amount: u64) -> Option<AssetBalanceOf<T>> {
-			let asset1 = asset1.into();
-			let asset2 = asset2.into();
+		pub fn quote_native(asset2: u32, amount: u64) -> Option<BalanceOf<T>> {
+			let asset2: T::AssetId = asset2.into();
 			let amount = amount.into();
-			let pool_id = Self::get_pool_id(asset1, asset2);
-			let (pool_asset1, _) = pool_id;
-
+			let pool_id = asset2;
+		
 			if let Some(pool) = Pools::<T>::get(pool_id) {
-				let (reserve1, reserve2) = if asset1 == pool_asset1 {
-					(pool.balance1, pool.balance2)
-				} else {
-					(pool.balance2, pool.balance1)
-				};
-				Self::quote(&amount, &reserve1, &reserve2).ok()
+				Self::quote_native_inner(&amount, &pool.balance_token, &pool.balance_native).ok()
 			} else {
 				None
 			}
@@ -599,9 +666,24 @@ pub mod pallet {
 
 		// TODO: we should probably use u128 for calculations
 		/// Calculates the optimal amount from the reserves.
-		pub fn quote(
+		pub fn quote_native_inner(
 			amount: &AssetBalanceOf<T>,
 			reserve1: &AssetBalanceOf<T>,
+			reserve2: &BalanceOf<T>,
+		) -> Result<BalanceOf<T>, Error<T>> {
+			// amount * reserve2 / reserve1
+			amount
+				.checked_mul(&reserve2)
+				.ok_or(Error::<T>::Overflow)?
+				.checked_div(&reserve1)
+				.ok_or(Error::<T>::Overflow)
+		}
+
+		// TODO: we should probably use u128 for calculations
+		/// Calculates the optimal amount from the reserves.
+		pub fn quote_token_inner(
+			amount: &BalanceOf<T>,
+			reserve1: &BalanceOf<T>,
 			reserve2: &AssetBalanceOf<T>,
 		) -> Result<AssetBalanceOf<T>, Error<T>> {
 			// amount * reserve2 / reserve1
@@ -616,9 +698,39 @@ pub mod pallet {
 		///
 		/// Given an input amount of an asset and pair reserves, returns the maximum output amount
 		/// of the other asset
-		pub fn get_amount_out(
+		pub fn get_native_out(
 			amount_in: &AssetBalanceOf<T>,
 			reserve_in: &AssetBalanceOf<T>,
+			reserve_out: &BalanceOf<T>,
+		) -> Result<BalanceOf<T>, Error<T>> {
+			if reserve_in.is_zero() || reserve_out.is_zero() {
+				return Err(Error::<T>::InsufficientLiquidity.into())
+			}
+
+			// TODO: extract 0.3% into config
+			// TODO: could use Permill type
+			let amount_in_with_fee =
+				amount_in.checked_mul(&997u64.into()).ok_or(Error::<T>::Overflow)?;
+
+			let numerator =
+				amount_in_with_fee.checked_mul(reserve_out).ok_or(Error::<T>::Overflow)?;
+
+			let denominator = reserve_in
+				.checked_mul(&1000u64.into())
+				.ok_or(Error::<T>::Overflow)?
+				.checked_add(&amount_in_with_fee)
+				.ok_or(Error::<T>::Overflow)?;
+
+			numerator.checked_div(&denominator).ok_or(Error::<T>::Overflow)
+		}
+
+		/// Calculates amount out
+		///
+		/// Given an input amount of an asset and pair reserves, returns the maximum output amount
+		/// of the other asset
+		pub fn get_tokens_out(
+			amount_in: &BalanceOf<T>,
+			reserve_in: &BalanceOf<T>,
 			reserve_out: &AssetBalanceOf<T>,
 		) -> Result<AssetBalanceOf<T>, Error<T>> {
 			if reserve_in.is_zero() || reserve_out.is_zero() {
@@ -646,11 +758,11 @@ pub mod pallet {
 		///
 		/// Given an output amount of an asset and pair reserves, returns a required input amount
 		/// of the other asset
-		pub fn get_amount_in(
+		pub fn get_native_in(
 			amount_out: &AssetBalanceOf<T>,
-			reserve_in: &AssetBalanceOf<T>,
+			reserve_in: &BalanceOf<T>,
 			reserve_out: &AssetBalanceOf<T>,
-		) -> Result<AssetBalanceOf<T>, Error<T>> {
+		) -> Result<BalanceOf<T>, Error<T>> {
 			if reserve_in.is_zero() || reserve_out.is_zero() {
 				return Err(Error::<T>::InsufficientLiquidity.into())
 			}
@@ -675,22 +787,37 @@ pub mod pallet {
 				.ok_or(Error::<T>::Overflow)
 		}
 
-		pub fn validate_swap(
-			asset_from: T::AssetId,
-			amount_out: AssetBalanceOf<T>,
-			pool_id: PoolIdOf<T>,
-			reserve1: AssetBalanceOf<T>,
-			reserve2: AssetBalanceOf<T>,
-		) -> Result<(T::AssetId, AssetBalanceOf<T>), Error<T>> {
-			let (pool_asset1, pool_asset2) = pool_id;
-
-			if asset_from == pool_asset1 {
-				ensure!(amount_out < reserve2, Error::<T>::InsufficientLiquidity);
-				Ok((pool_asset2, amount_out))
-			} else {
-				ensure!(amount_out < reserve1, Error::<T>::InsufficientLiquidity);
-				Ok((pool_asset1, amount_out))
+		/// Calculates amount in
+		///
+		/// Given an output amount of an asset and pair reserves, returns a required input amount
+		/// of the other asset
+		pub fn get_tokens_in(
+			amount_out: &BalanceOf<T>,
+			reserve_in: &AssetBalanceOf<T>,
+			reserve_out: &BalanceOf<T>,
+		) -> Result<AssetBalanceOf<T>, Error<T>> {
+			if reserve_in.is_zero() || reserve_out.is_zero() {
+				return Err(Error::<T>::InsufficientLiquidity.into())
 			}
+
+			// TODO: extract 0.3% into config
+			let numerator = reserve_in
+				.checked_mul(amount_out)
+				.ok_or(Error::<T>::Overflow)?
+				.checked_mul(&1000u64.into())
+				.ok_or(Error::<T>::Overflow)?;
+
+			let denominator = reserve_out
+				.checked_sub(amount_out)
+				.ok_or(Error::<T>::Overflow)?
+				.checked_mul(&997u64.into())
+				.ok_or(Error::<T>::Overflow)?;
+
+			numerator
+				.checked_div(&denominator)
+				.ok_or(Error::<T>::Overflow)?
+				.checked_add(&One::one())
+				.ok_or(Error::<T>::Overflow)
 		}
 
 		#[cfg(test)]
