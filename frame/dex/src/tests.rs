@@ -309,8 +309,195 @@ fn sell_exact_asset_for_native_should_work() {
 		let expect_receive =
 			Dex::get_native_out(&exchange_amount, &liquidity2, &liquidity1).ok().unwrap();
 		let pallet_account = Dex::account_id();
+		assert_eq!(expect_receive, 332);
 		assert_eq!(currency_balance(user), expect_receive);
 		assert_eq!(currency_balance(pallet_account), liquidity1 - expect_receive);
 		assert_eq!(balance(pallet_account, asset_2), liquidity2 + exchange_amount);
+	});
+}
+
+#[test]
+fn sell_asset_for_exact_native_should_work() {
+	new_test_ext().execute_with(|| {
+		let user = 1;
+		let asset_id = 2;
+		let deadline = 2;
+		let pallet_account = Dex::account_id();
+
+		create_assets(user, vec![asset_id]);
+		assert_ok!(Dex::create_pool(RuntimeOrigin::signed(user), asset_id));
+
+		assert_ok!(Balances::set_balance(RuntimeOrigin::root(), user, 1000, 0));
+		assert_ok!(Assets::mint(RuntimeOrigin::signed(user), asset_id, user, 1000));
+
+		let before_native = currency_balance(pallet_account) + currency_balance(user);
+		let before_asset = balance(pallet_account, asset_id) + balance(user, asset_id);
+
+		let liquidity_native = 1000;
+		let liquidity_asset = 20;
+		assert_ok!(Dex::add_liquidity(
+			RuntimeOrigin::signed(user),
+			asset_id,
+			liquidity_native,
+			liquidity_asset,
+			1,
+			1,
+			user,
+			deadline
+		));
+
+		assert_eq!(currency_balance(user), 0);
+
+		let requested_native = 1;
+		assert_ok!(Dex::sell_asset_for_exact_native(
+			RuntimeOrigin::signed(user),
+			asset_id,
+			requested_native, // native_amount_out
+			60,               // asset_amount_in_max
+			user,
+			3
+		));
+
+		let expect_give = Dex::get_asset_in(&requested_native, &liquidity_native, &liquidity_asset)
+			.ok()
+			.unwrap();
+
+		assert_eq!(currency_balance(user), requested_native, "should receive exact amount");
+		assert_eq!(currency_balance(pallet_account), liquidity_native - requested_native);
+		assert_eq!(balance(pallet_account, asset_id), liquidity_asset + dbg!(expect_give));
+
+		// check invariants:
+
+		// dot and asset totals should be preserved.
+		let after_native = currency_balance(pallet_account) + currency_balance(user);
+		let after_asset = balance(pallet_account, asset_id) + balance(user, asset_id);
+		assert_eq!(before_native, after_native);
+		assert_eq!(before_asset, after_asset);
+	});
+}
+
+#[test]
+fn buy_asset_for_exact_native_should_work() {
+	new_test_ext().execute_with(|| {
+		let user = 1;
+		let asset_id = 2;
+		let deadline = 2;
+		let pallet_account = Dex::account_id();
+
+		create_assets(user, vec![asset_id]);
+		assert_ok!(Dex::create_pool(RuntimeOrigin::signed(user), asset_id));
+
+		assert_ok!(Balances::set_balance(RuntimeOrigin::root(), user, 3000, 0));
+		assert_ok!(Assets::mint(RuntimeOrigin::signed(user), asset_id, user, 1000));
+
+		let before_native = currency_balance(pallet_account) + currency_balance(user);
+		let before_asset = balance(pallet_account, asset_id) + balance(user, asset_id);
+
+		let liquidity_native = 1000;
+		let liquidity_asset = 20;
+		assert_ok!(Dex::add_liquidity(
+			RuntimeOrigin::signed(user),
+			asset_id,
+			liquidity_native,
+			liquidity_asset,
+			1,
+			1,
+			user,
+			deadline
+		));
+
+		assert_eq!(currency_balance(user), 2000);
+		// assert_debit_credit(|| getter, || getter_creditor, 200, || action);
+
+		let given_native = 1;
+		assert_ok!(Dex::buy_asset_for_exact_native(
+			RuntimeOrigin::signed(user),
+			asset_id,
+			given_native, // native_amount_in
+			10,           // asset_amount_out_max
+			user,
+			3
+		));
+
+		let expect_give = Dex::get_asset_out(&given_native, &liquidity_native, &liquidity_asset)
+			.ok()
+			.unwrap();
+
+		assert_eq!(currency_balance(user), 2000 - given_native, "should receive exact amount");
+		assert_eq!(currency_balance(pallet_account), liquidity_native + given_native);
+		assert_eq!(balance(pallet_account, asset_id), liquidity_asset - dbg!(expect_give));
+
+		// check invariants:
+
+		// dot and asset totals should be preserved.
+		let after_native = currency_balance(pallet_account) + currency_balance(user);
+		let after_asset = balance(pallet_account, asset_id) + balance(user, asset_id);
+		assert_eq!(before_native, after_native);
+		assert_eq!(before_asset, after_asset);
+	});
+}
+
+#[test]
+fn buy_exact_asset_for_native_should_work() {
+	new_test_ext().execute_with(|| {
+		let user = 1;
+		let asset_id = 2;
+		let deadline = 2;
+		let pallet_account = Dex::account_id();
+
+		create_assets(user, vec![asset_id]);
+		assert_ok!(Dex::create_pool(RuntimeOrigin::signed(user), asset_id));
+
+		assert_ok!(Balances::set_balance(RuntimeOrigin::root(), user, 3000, 0));
+		assert_ok!(Assets::mint(RuntimeOrigin::signed(user), asset_id, user, 1000));
+
+		let before_native = currency_balance(pallet_account) + currency_balance(user);
+		let before_asset = balance(pallet_account, asset_id) + balance(user, asset_id);
+
+		let liquidity_native = 1000;
+		let liquidity_asset = 20;
+		assert_ok!(Dex::add_liquidity(
+			RuntimeOrigin::signed(user),
+			asset_id,
+			liquidity_native,
+			liquidity_asset,
+			1,
+			1,
+			user,
+			deadline
+		));
+
+		assert_eq!(currency_balance(user), 2000);
+		// assert_debit_credit(|| getter, || getter_creditor, 200, || action);
+
+		let requested_assets = 1;
+		assert_ok!(Dex::buy_exact_asset_for_native(
+			RuntimeOrigin::signed(user),
+			asset_id,
+			requested_assets, // asset_amount_out
+			100,              // native_amount_in_max
+			user,
+			3
+		));
+
+		let expect_give =
+			Dex::get_native_in(&requested_assets, &liquidity_native, &liquidity_asset)
+				.ok()
+				.unwrap();
+
+		assert_eq!(currency_balance(user), 2000 - expect_give, "should receive exact amount");
+		assert_eq!(currency_balance(pallet_account), liquidity_native + expect_give);
+		assert_eq!(balance(pallet_account, asset_id), liquidity_asset - dbg!(requested_assets));
+		assert_eq!(balance(user, asset_id), 1000 - liquidity_asset + dbg!(requested_assets));
+
+		// check invariants:
+
+		// dot and asset totals should be preserved.
+		let after_native = currency_balance(pallet_account) + currency_balance(user);
+		let after_asset = balance(pallet_account, asset_id) + balance(user, asset_id);
+		assert_eq!(before_native, after_native);
+		assert_eq!(before_asset, after_asset);
+
+		// TODO: check pool always grows bigger invariant.
 	});
 }

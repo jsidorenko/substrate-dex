@@ -177,7 +177,7 @@ pub mod pallet {
 		WrongDesiredAmount,
 		/// The deadline has already passed.
 		DeadlinePassed,
-		/// The pool doesn't exist.
+		/// The pool (asset id) doesn't exist in this instance of the dex.
 		PoolNotFound,
 		/// An overflow happened.
 		Overflow,
@@ -191,11 +191,11 @@ pub mod pallet {
 		ZeroLiquidity,
 		/// Amount can't be zero.
 		ZeroAmount,
-		/// Calculated amount out is less than min desired.
+		/// Calculated amount out is less than min desired. To fix,
 		InsufficientOutputAmount,
 		/// Insufficient liquidity in the pool.
 		InsufficientLiquidity,
-		/// Excessive input amount.
+		/// `Excessive input amount` means the amount_in_max param is set too low.
 		ExcessiveInputAmount,
 	}
 
@@ -272,17 +272,26 @@ pub mod pallet {
 						Self::quote_asset_inner(&native_desired, &reserve_native, &reserve_asset)?;
 
 					if amount_asset_optimal <= asset_desired {
-						ensure!(amount_asset_optimal >= amount_asset_min, Error::<T>::InsufficientAmount);
+						ensure!(
+							amount_asset_optimal >= amount_asset_min,
+							Error::<T>::InsufficientAmount
+						);
 						amount_native = native_desired;
 						amount_asset = amount_asset_optimal;
 					} else {
-						let amount_native_optimal =
-							Self::quote_native_inner(&asset_desired, &reserve_asset, &reserve_native)?;
+						let amount_native_optimal = Self::quote_native_inner(
+							&asset_desired,
+							&reserve_asset,
+							&reserve_native,
+						)?;
 						ensure!(
 							amount_native_optimal <= native_desired,
 							Error::<T>::OptimalAmountLessThanDesired
 						);
-						ensure!(amount_native_optimal >= amount_native_min, Error::<T>::InsufficientAmount);
+						ensure!(
+							amount_native_optimal >= amount_native_min,
+							Error::<T>::InsufficientAmount
+						);
 						amount_native = amount_native_optimal;
 						amount_asset = asset_desired;
 					}
@@ -417,14 +426,14 @@ pub mod pallet {
 			origin: OriginFor<T>,
 			asset_id: T::AssetId,
 			amount_out: AssetBalanceOf<T>,
-			amount_in_min: BalanceOf<T>,
+			amount_in_max: BalanceOf<T>,
 			send_to: T::AccountId,
 			deadline: T::BlockNumber,
 		) -> DispatchResult {
 			let sender = ensure_signed(origin)?;
 
 			ensure!(
-				amount_out > Zero::zero() && amount_in_min > Zero::zero(),
+				amount_out > Zero::zero() && amount_in_max > Zero::zero(),
 				Error::<T>::ZeroAmount
 			);
 
@@ -437,15 +446,15 @@ pub mod pallet {
 				let amount_in =
 					Self::get_native_in(&amount_out, &pool.balance_native, &pool.balance_asset)?;
 
-				ensure!(amount_in >= amount_in_min, Error::<T>::InsufficientOutputAmount);
+				ensure!(amount_in <= amount_in_max, Error::<T>::InsufficientOutputAmount);
 
 				let pallet_account = Self::account_id();
 
-				T::Currency::transfer(&sender, &pallet_account, amount_out, false)?;
+				T::Currency::transfer(&sender, &pallet_account, amount_in, false)?; //TODO keep alive true
 
 				ensure!(amount_out < pool.balance_asset, Error::<T>::InsufficientLiquidity);
 
-				T::Assets::transfer(asset_id, &pallet_account, &send_to, amount_in, false)?;
+				T::Assets::transfer(asset_id, &pallet_account, &send_to, amount_out, false)?;
 
 				pool.balance_native += amount_in;
 				pool.balance_asset -= amount_out;
@@ -496,7 +505,7 @@ pub mod pallet {
 
 				ensure!(amount_out < pool.balance_native, Error::<T>::InsufficientLiquidity);
 
-				T::Currency::transfer(&pallet_account, &sender, amount_out, false)?;
+				T::Currency::transfer(&pallet_account, &send_to, amount_out, false)?;
 
 				pool.balance_asset += amount_in;
 				pool.balance_native -= amount_out;
@@ -585,17 +594,20 @@ pub mod pallet {
 			Pools::<T>::try_mutate(&asset_id, |maybe_pool| {
 				let pool = maybe_pool.as_mut().ok_or(Error::<T>::PoolNotFound)?;
 
-				let amount_in =
-					Self::get_asset_in(&amount_out, &pool.balance_native, &pool.balance_asset)?;
+				let amount_in = dbg!(Self::get_asset_in(
+					&amount_out,
+					&pool.balance_native,
+					&pool.balance_asset
+				)?);
 				ensure!(amount_in <= amount_in_max, Error::<T>::ExcessiveInputAmount);
 
 				let pallet_account = Self::account_id();
 
-				T::Assets::transfer(asset_id, &pallet_account, &send_to, amount_in, false)?;
+				T::Assets::transfer(asset_id, &sender, &pallet_account, amount_in, false)?;
 
 				ensure!(amount_out < pool.balance_native, Error::<T>::InsufficientLiquidity);
 
-				T::Currency::transfer(&sender, &pallet_account, amount_out, false)?;
+				T::Currency::transfer(&pallet_account, &send_to, amount_out, false)?;
 
 				pool.balance_asset += amount_in;
 				pool.balance_native -= amount_out;
@@ -625,7 +637,7 @@ pub mod pallet {
 		pub fn quote_asset(asset_id: u32, amount: u64) -> Option<AssetBalanceOf<T>> {
 			let asset_id: T::AssetId = asset_id.into();
 			let amount = amount.into();
-		
+
 			if let Some(pool) = Pools::<T>::get(asset_id) {
 				Self::quote_asset_inner(&amount, &pool.balance_native, &pool.balance_asset).ok()
 			} else {
@@ -636,7 +648,7 @@ pub mod pallet {
 		pub fn quote_native(asset_id: u32, amount: u64) -> Option<BalanceOf<T>> {
 			let asset_id: T::AssetId = asset_id.into();
 			let amount = amount.into();
-		
+
 			if let Some(pool) = Pools::<T>::get(asset_id) {
 				Self::quote_native_inner(&amount, &pool.balance_asset, &pool.balance_native).ok()
 			} else {
