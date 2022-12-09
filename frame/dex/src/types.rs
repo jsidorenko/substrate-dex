@@ -23,11 +23,11 @@ pub struct PoolInfo<AccountId, AssetId, PoolAssetId, NativeBalance, AssetBalance
 	/// Owner of the pool
 	pub owner: AccountId,
 	/// Liquidity pool asset
-	pub lp_token: PoolAssetId,
+	pub lp_asset: PoolAssetId,
 	/// The second asset supported by the pool (first is the native currency)
-	pub token_asset_id: AssetId,
-	/// Pool balance of asset1 (native currency)
+	pub asset_id: AssetId,
+	/// Pool balance of the native currency
 	pub balance_native: NativeBalance,
-	/// Pool balance of asset2
-	pub balance_token: AssetBalance,
+	/// Pool balance of the other asset
+	pub balance_asset: AssetBalance,
 }
